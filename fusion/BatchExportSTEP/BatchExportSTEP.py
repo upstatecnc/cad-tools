@@ -1,14 +1,16 @@
 """
-BatchExportSTEP - Fusion script (command dialog version)
+BatchExportSTEP - Fusion add-in
 
-Opens a Fusion command dialog where you set everything before exporting:
+Adds a "Batch STEP Export" button to Utilities > Add-Ins in the Design workspace.
+The button opens a command dialog where you set everything before exporting:
   - Scope: select one component in the canvas/browser, or leave empty for the whole design
   - Export: one STEP file per component, or one per body
   - Options: skip empty sub-assemblies / skip hidden bodies / solid bodies only
   - Output folder (with Browse button) and "open folder when done"
   - Live count of how many files will be written
 
-Your last-used options and folder are remembered in settings.json next to this script.
+Your last-used options and folder are remembered in a settings.json file in your
+user app-data folder (see settings_path), so they survive updates to the add-in.
 """
 
 import adsk.core
@@ -20,11 +22,14 @@ import sys
 import json
 import subprocess
 
+ADDIN_NAME = 'BatchExportSTEP'
 CMD_ID = 'BatchExportSTEP_cmd'
 CMD_NAME = 'Batch STEP Export'
 CMD_TIP = 'Export each component or body to its own STEP file'
+WORKSPACE_ID = 'FusionSolidEnvironment'
+PANEL_ID = 'SolidScriptsAddinsPanel'
+ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
 DEFAULTS = {
     'mode': 0,              # 0 = per component, 1 = per body
     'skip_empty': True,
@@ -36,15 +41,26 @@ DEFAULTS = {
 
 _app = None
 _ui = None
-_handlers = []
+_handlers = []       # lives for the whole session (button click handler)
+_cmd_handlers = []   # lives for one open dialog; replaced each time it opens
 
 
 # ---------------- helpers ----------------
 
+def settings_path():
+    if sys.platform.startswith('win'):
+        base = os.environ.get('APPDATA') or os.path.expanduser('~\\AppData\\Roaming')
+    elif sys.platform == 'darwin':
+        base = os.path.expanduser('~/Library/Application Support')
+    else:
+        base = os.path.expanduser('~/.config')
+    return os.path.join(base, ADDIN_NAME, 'settings.json')
+
+
 def load_settings():
     s = dict(DEFAULTS)
     try:
-        with open(SETTINGS_FILE, 'r') as f:
+        with open(settings_path(), 'r') as f:
             s.update(json.load(f))
     except Exception:
         pass
@@ -53,7 +69,9 @@ def load_settings():
 
 def save_settings(s):
     try:
-        with open(SETTINGS_FILE, 'w') as f:
+        path = settings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
             json.dump(s, f, indent=2)
     except Exception:
         pass  # not critical
@@ -213,6 +231,10 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         try:
             cmd = adsk.core.Command.cast(args.command)
+            if not adsk.fusion.Design.cast(_app.activeProduct):
+                _ui.messageBox('Open a design in the Design workspace first.', CMD_NAME)
+                return
+
             cmd.okButtonText = 'Export'
             cmd.setDialogMinimumSize(380, 300)
             inputs = cmd.commandInputs
@@ -240,14 +262,14 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
 
             inputs.addTextBoxCommandInput('summary', '', '', 1, True)
 
+            _cmd_handlers.clear()
             for event, handler in (
                     (cmd.inputChanged, InputChangedHandler()),
                     (cmd.validateInputs, ValidateHandler()),
                     (cmd.activate, ActivateHandler()),
-                    (cmd.execute, ExecuteHandler()),
-                    (cmd.destroy, DestroyHandler())):
+                    (cmd.execute, ExecuteHandler())):
                 event.add(handler)
-                _handlers.append(handler)
+                _cmd_handlers.append(handler)
         except Exception:
             _ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
 
@@ -298,12 +320,17 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             _ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
 
 
-class DestroyHandler(adsk.core.CommandEventHandler):
-    def notify(self, args):
-        adsk.terminate()
+# ---------------- add-in entry points ----------------
 
+def remove_ui():
+    panel = _ui.allToolbarPanels.itemById(PANEL_ID)
+    control = panel.controls.itemById(CMD_ID) if panel else None
+    if control:
+        control.deleteMe()
+    cmd_def = _ui.commandDefinitions.itemById(CMD_ID)
+    if cmd_def:
+        cmd_def.deleteMe()
 
-# ---------------- entry point ----------------
 
 def run(context):
     global _app, _ui
@@ -311,30 +338,27 @@ def run(context):
         _app = adsk.core.Application.get()
         _ui = _app.userInterface
 
-        if not adsk.fusion.Design.cast(_app.activeProduct):
-            _ui.messageBox('Open a design (Design workspace) before running this script.')
-            return
+        remove_ui()  # clear leftovers if a previous session didn't stop cleanly
 
-        cmd_def = _ui.commandDefinitions.itemById(CMD_ID)
-        if cmd_def:
-            cmd_def.deleteMe()
-        cmd_def = _ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_TIP)
-
+        cmd_def = _ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_TIP, ICON_FOLDER)
         on_created = CreatedHandler()
         cmd_def.commandCreated.add(on_created)
         _handlers.append(on_created)
 
-        cmd_def.execute()
-        adsk.autoTerminate(False)  # keep the script alive while the dialog is open
+        panel = _ui.workspaces.itemById(WORKSPACE_ID).toolbarPanels.itemById(PANEL_ID)
+        control = panel.controls.addCommand(cmd_def)
+        control.isPromotedByDefault = True
+        control.isPromoted = True
     except Exception:
         if _ui:
-            _ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
+            _ui.messageBox('Failed to start {}:\n{}'.format(CMD_NAME, traceback.format_exc()))
 
 
 def stop(context):
     try:
-        cmd_def = _ui.commandDefinitions.itemById(CMD_ID) if _ui else None
-        if cmd_def:
-            cmd_def.deleteMe()
+        if _ui:
+            remove_ui()
     except Exception:
         pass
+    _handlers.clear()
+    _cmd_handlers.clear()
